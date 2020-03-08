@@ -4,7 +4,9 @@ usage() {
     echo "Usage: $0 [action] [options] <pid>"
     echo "Actions:"
     echo "  start             start profiling and return immediately"
+    echo "  resume            resume profiling without resetting collected data"
     echo "  stop              stop profiling"
+    echo "  check             check if the specified profiling event is available"
     echo "  status            print profiling status"
     echo "  list              list profiling events supported by the target JVM"
     echo "  collect           collect profile for the specified period of time"
@@ -18,8 +20,11 @@ usage() {
     echo "  -b bufsize        frame buffer size"
     echo "  -t                profile different threads separately"
     echo "  -s                simple class names instead of FQN"
+    echo "  -g                print method signatures"
     echo "  -a                annotate Java method names"
-    echo "  -o fmt[,fmt...]   output format: summary|traces|flat|collapsed|svg|tree|jfr"
+    echo "  -o fmt            output format: summary|traces|flat|collapsed|svg|tree|jfr"
+    echo "  -I include        output only stack traces containing the specified pattern"
+    echo "  -X exclude        exclude stack traces with the specified pattern"
     echo "  -v, --version     display version string"
     echo ""
     echo "  --title string    SVG title"
@@ -30,6 +35,8 @@ usage() {
     echo ""
     echo "  --all-kernel      only include kernel-mode events"
     echo "  --all-user        only include user-mode events"
+    echo "  --cstack          collect C stack when profiling Java-level events"
+    echo "  --no-cstack       never collect C stack"
     echo ""
     echo "<pid> is a numeric process ID of the target JVM"
     echo "      or 'jps' keyword to find running JVM automatically"
@@ -44,8 +51,8 @@ mirror_output() {
     # Mirror output from temporary file to local terminal
     if [[ $USE_TMP ]]; then
         if [[ -f $FILE ]]; then
-            cat $FILE
-            rm $FILE
+            cat "$FILE"
+            rm "$FILE"
         fi
     fi
 }
@@ -58,7 +65,7 @@ check_if_terminated() {
 }
 
 jattach() {
-    $JATTACH $PID load "$PROFILER" true "$1" > /dev/null
+    "$JATTACH" $PID load "$PROFILER" true "$1" > /dev/null
     RET=$?
 
     # Check if jattach failed
@@ -79,16 +86,16 @@ jattach() {
 
 function abspath() {
     if [ "$UNAME_S" == "Darwin" ]; then
-        perl -MCwd -e 'print Cwd::abs_path shift' $1
+        perl -MCwd -e 'print Cwd::abs_path shift' "$1"
     else
-        readlink -f $1
+        readlink -f "$1"
     fi
 }
 
 
 OPTIND=1
 UNAME_S=$(uname -s)
-SCRIPT_DIR=$(dirname $(abspath $0))
+SCRIPT_DIR=$(dirname "$(abspath "$0")")
 JATTACH=$SCRIPT_DIR/build/jattach
 PROFILER=$SCRIPT_DIR/build/libasyncProfiler.so
 ACTION="collect"
@@ -96,20 +103,16 @@ EVENT="cpu"
 DURATION="60"
 FILE=""
 USE_TMP="true"
-INTERVAL=""
-JSTACKDEPTH=""
-FRAMEBUF=""
-THREADS=""
-RING=""
 OUTPUT=""
 FORMAT=""
+PARAMS=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         -h|"-?")
             usage
             ;;
-        start|stop|status|list|collect)
+        start|resume|stop|check|status|list|collect)
             ACTION="$1"
             ;;
         -v|--version)
@@ -129,28 +132,39 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -i)
-            INTERVAL=",interval=$2"
+            PARAMS="$PARAMS,interval=$2"
             shift
             ;;
         -j)
-            JSTACKDEPTH=",jstackdepth=$2"
+            PARAMS="$PARAMS,jstackdepth=$2"
             shift
             ;;
         -b)
-            FRAMEBUF=",framebuf=$2"
+            PARAMS="$PARAMS,framebuf=$2"
             shift
             ;;
         -t)
-            THREADS=",threads"
+            PARAMS="$PARAMS,threads"
             ;;
         -s)
             FORMAT="$FORMAT,simple"
+            ;;
+        -g)
+            FORMAT="$FORMAT,sig"
             ;;
         -a)
             FORMAT="$FORMAT,ann"
             ;;
         -o)
             OUTPUT="$2"
+            shift
+            ;;
+        -I|--include)
+            FORMAT="$FORMAT,include=$2"
+            shift
+            ;;
+        -X|--exclude)
+            FORMAT="$FORMAT,exclude=$2"
             shift
             ;;
         --title)
@@ -170,10 +184,16 @@ while [[ $# -gt 0 ]]; do
             FORMAT="$FORMAT,reverse"
             ;;
         --all-kernel)
-            RING=",allkernel"
+            PARAMS="$PARAMS,allkernel"
             ;;
         --all-user)
-            RING=",alluser"
+            PARAMS="$PARAMS,alluser"
+            ;;
+        --cstack)
+            PARAMS="$PARAMS,cstack=y"
+            ;;
+        --no-cstack)
+            PARAMS="$PARAMS,cstack=n"
             ;;
         [0-9]*)
             PID="$1"
@@ -199,26 +219,14 @@ fi
 # Let the target process create the file in case this script is run by superuser.
 if [[ $USE_TMP ]]; then
     FILE=/tmp/async-profiler.$$.$PID
-fi
-
-# select default output format
-if [[ "$OUTPUT" == "" ]]; then
-    if [[ $FILE == *.svg ]]; then
-        OUTPUT="svg"
-    elif [[ $FILE == *.html ]]; then
-        OUTPUT="tree"
-    elif [[ $FILE == *.jfr ]]; then
-        OUTPUT="jfr"
-    elif [[ $FILE == *.collapsed ]] || [[ $FILE == *.folded ]]; then
-        OUTPUT="collapsed"
-    else
-        OUTPUT="summary,traces=200,flat=200"
-    fi
+elif [[ $FILE != /* ]]; then
+    # Output file is written by the target process. Make the path absolute to avoid confusion.
+    FILE=$PWD/$FILE
 fi
 
 case $ACTION in
-    start)
-        jattach "start,event=$EVENT,file=$FILE$INTERVAL$JSTACKDEPTH$FRAMEBUF$THREADS$RING,$OUTPUT$FORMAT"
+    start|resume|check)
+        jattach "$ACTION,event=$EVENT,file=$FILE,$OUTPUT$FORMAT$PARAMS"
         ;;
     stop)
         jattach "stop,file=$FILE,$OUTPUT$FORMAT"
@@ -230,7 +238,7 @@ case $ACTION in
         jattach "list,file=$FILE"
         ;;
     collect)
-        jattach "start,event=$EVENT,file=$FILE$INTERVAL$JSTACKDEPTH$FRAMEBUF$THREADS$RING,$OUTPUT$FORMAT"
+        jattach "start,event=$EVENT,file=$FILE,$OUTPUT$FORMAT$PARAMS"
         while (( DURATION-- > 0 )); do
             check_if_terminated
             sleep 1
@@ -239,9 +247,9 @@ case $ACTION in
         ;;
     version)
         if [[ "$PID" == "" ]]; then
-            java "-agentpath:$PROFILER=version" -version 2> /dev/null
+            java "-agentpath:$PROFILER=version=full" -version 2> /dev/null
         else
-            jattach "version,file=$FILE"
+            jattach "version=full,file=$FILE"
         fi
         ;;
 esac

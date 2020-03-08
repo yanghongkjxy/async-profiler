@@ -44,14 +44,20 @@ class PerfEvents : public Engine {
 
     const char* units();
 
+    Error check(Arguments& args);
     Error start(Arguments& args);
     void stop();
 
-    void onThreadStart();
-    void onThreadEnd();
+    void onThreadStart(int tid) {
+        createForThread(tid);
+    }
+
+    void onThreadEnd(int tid) {
+        destroyForThread(tid);
+    }
 
     int getNativeTrace(void* ucontext, int tid, const void** callchain, int max_depth,
-                       const void* jit_min_address, const void* jit_max_address);
+                       CodeCache* java_methods, CodeCache* runtime_stubs);
 
     static bool supported();
     static const char* getEventName(int event_id);

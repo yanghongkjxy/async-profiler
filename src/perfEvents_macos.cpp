@@ -35,6 +35,10 @@ const char* PerfEvents::units() {
     return "ns";
 }
 
+Error PerfEvents::check(Arguments& args) {
+    return Error("PerfEvents are unsupported on macOS");
+}
+
 Error PerfEvents::start(Arguments& args) {
     return Error("PerfEvents are unsupported on macOS");
 }
@@ -42,14 +46,8 @@ Error PerfEvents::start(Arguments& args) {
 void PerfEvents::stop() {
 }
 
-void PerfEvents::onThreadStart() {
-}
-
-void PerfEvents::onThreadEnd() {
-}
-
 int PerfEvents::getNativeTrace(void* ucontext, int tid, const void** callchain, int max_depth,
-                               const void* jit_min_address, const void* jit_max_address) {
+                               CodeCache* java_methods, CodeCache* runtime_stubs) {
     return 0;
 }
 

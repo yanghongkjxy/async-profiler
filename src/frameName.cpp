@@ -22,21 +22,90 @@
 #include "vmStructs.h"
 
 
-FrameName::FrameName(bool simple, bool annotate, bool dotted, Mutex& thread_names_lock, ThreadMap& thread_names) :
+Matcher::Matcher(const char* pattern) {
+    if (pattern[0] == '*') {
+        _type = MATCH_ENDS_WITH;
+        _pattern = strdup(pattern + 1);
+    } else {
+        _type = MATCH_EQUALS;
+        _pattern = strdup(pattern);
+    }
+
+    _len = strlen(_pattern);
+    if (_len > 0 && _pattern[_len - 1] == '*') {
+        _type = _type == MATCH_EQUALS ? MATCH_STARTS_WITH : MATCH_CONTAINS;
+        _pattern[--_len] = 0;
+    }
+}
+
+Matcher::~Matcher() {
+    free(_pattern);
+}
+
+Matcher::Matcher(const Matcher& m) {
+    _type = m._type;
+    _pattern = strdup(m._pattern);
+    _len = m._len;
+}
+
+Matcher& Matcher::operator=(const Matcher& m) {
+    free(_pattern);
+
+    _type = m._type;
+    _pattern = strdup(m._pattern);
+    _len = m._len;
+
+    return *this;
+}
+
+bool Matcher::matches(const char* s) {
+    switch (_type) {
+        case MATCH_EQUALS:
+            return strcmp(s, _pattern) == 0;
+        case MATCH_CONTAINS:
+            return strstr(s, _pattern) != NULL;
+        case MATCH_STARTS_WITH:
+            return strncmp(s, _pattern, _len) == 0;
+        case MATCH_ENDS_WITH:
+            int slen = strlen(s);
+            return slen >= _len && strcmp(s + slen - _len, _pattern) == 0;
+    }
+    return false;
+}
+
+
+FrameName::FrameName(Arguments& args, int style, Mutex& thread_names_lock, ThreadMap& thread_names) :
     _cache(),
-    _simple(simple),
-    _annotate(annotate),
-    _dotted(dotted),
+    _include(),
+    _exclude(),
+    _style(style),
     _thread_names_lock(thread_names_lock),
     _thread_names(thread_names)
 {
     // Require printf to use standard C format regardless of system locale
     _saved_locale = uselocale(newlocale(LC_NUMERIC_MASK, "C", (locale_t)0));
     memset(_buf, 0, sizeof(_buf));
+
+    buildFilter(_include, args._buf, args._include);
+    buildFilter(_exclude, args._buf, args._exclude);
 }
 
 FrameName::~FrameName() {
     freelocale(uselocale(_saved_locale));
+}
+
+void FrameName::buildFilter(std::vector<Matcher>& vector, const char* base, int offset) {
+    while (offset != 0) {
+        vector.push_back(base + offset);
+        offset = ((int*)(base + offset))[-1];
+    }
+}
+
+char* FrameName::truncate(char* name, int max_length) {
+    if (strlen(name) > max_length && max_length >= 4) {
+        strcpy(name + max_length - 4, "...)");
+    }
+    return name;
 }
 
 const char* FrameName::cppDemangle(const char* name) {
@@ -56,31 +125,34 @@ char* FrameName::javaMethodName(jmethodID method) {
     jclass method_class;
     char* class_name = NULL;
     char* method_name = NULL;
+    char* method_sig = NULL;
     char* result;
 
     jvmtiEnv* jvmti = VM::jvmti();
     jvmtiError err;
 
-    if ((err = jvmti->GetMethodName(method, &method_name, NULL, NULL)) == 0 &&
+    if ((err = jvmti->GetMethodName(method, &method_name, &method_sig, NULL)) == 0 &&
         (err = jvmti->GetMethodDeclaringClass(method, &method_class)) == 0 &&
         (err = jvmti->GetClassSignature(method_class, &class_name, NULL)) == 0) {
         // Trim 'L' and ';' off the class descriptor like 'Ljava/lang/Object;'
-        result = javaClassName(class_name + 1, strlen(class_name) - 2, _simple, _dotted);
+        result = javaClassName(class_name + 1, strlen(class_name) - 2, _style);
         strcat(result, ".");
         strcat(result, method_name);
-        if (_annotate) strcat(result, "_[j]");
+        if (_style & STYLE_SIGNATURES) strcat(result, truncate(method_sig, 255));
+        if (_style & STYLE_ANNOTATE) strcat(result, "_[j]");
     } else {
-        snprintf(_buf, sizeof(_buf), "[jvmtiError %d]", err);
+        snprintf(_buf, sizeof(_buf) - 1, "[jvmtiError %d]", err);
         result = _buf;
     }
 
     jvmti->Deallocate((unsigned char*)class_name);
+    jvmti->Deallocate((unsigned char*)method_sig);
     jvmti->Deallocate((unsigned char*)method_name);
 
     return result;
 }
 
-char* FrameName::javaClassName(const char* symbol, int length, bool simple, bool dotted) {
+char* FrameName::javaClassName(const char* symbol, int length, int style) {
     char* result = _buf;
 
     int array_dimension = 0;
@@ -113,13 +185,13 @@ char* FrameName::javaClassName(const char* symbol, int length, bool simple, bool
         } while (--array_dimension > 0);
     }
 
-    if (simple) {
+    if (style & STYLE_SIMPLE) {
         for (char* s = result; *s; s++) {
             if (*s == '/') result = s + 1;
         }
     }
 
-    if (dotted) {
+    if (style & STYLE_DOTTED) {
         for (char* s = result; *s; s++) {
             if (*s == '/') *s = '.';
         }
@@ -128,7 +200,7 @@ char* FrameName::javaClassName(const char* symbol, int length, bool simple, bool
     return result;
 }
 
-const char* FrameName::name(ASGCT_CallFrame& frame) {
+const char* FrameName::name(ASGCT_CallFrame& frame, bool for_matching) {
     if (frame.method_id == NULL) {
         return "[unknown]";
     }
@@ -139,30 +211,32 @@ const char* FrameName::name(ASGCT_CallFrame& frame) {
 
         case BCI_SYMBOL: {
             VMSymbol* symbol = (VMSymbol*)frame.method_id;
-            char* class_name = javaClassName(symbol->body(), symbol->length(), _simple, true);
-            return strcat(class_name, _dotted ? "" : "_[i]");
+            char* class_name = javaClassName(symbol->body(), symbol->length(), _style | STYLE_DOTTED);
+            return for_matching ? class_name : strcat(class_name, _style & STYLE_DOTTED ? "" : "_[i]");
         }
 
         case BCI_SYMBOL_OUTSIDE_TLAB: {
             VMSymbol* symbol = (VMSymbol*)((uintptr_t)frame.method_id ^ 1);
-            char* class_name = javaClassName(symbol->body(), symbol->length(), _simple, true);
-            return strcat(class_name, _dotted ? " (out)" : "_[k]");
+            char* class_name = javaClassName(symbol->body(), symbol->length(), _style | STYLE_DOTTED);
+            return for_matching ? class_name : strcat(class_name, _style & STYLE_DOTTED ? " (out)" : "_[k]");
         }
 
         case BCI_THREAD_ID: {
             int tid = (int)(uintptr_t)frame.method_id;
             MutexLocker ml(_thread_names_lock);
             ThreadMap::iterator it = _thread_names.find(tid);
-            if (it != _thread_names.end()) {
-                snprintf(_buf, sizeof(_buf), "[%s tid=%d]", it->second.c_str(), tid);
+            if (for_matching) {
+                return it != _thread_names.end() ? it->second.c_str() : "";
+            } else if (it != _thread_names.end()) {
+                snprintf(_buf, sizeof(_buf) - 1, "[%s tid=%d]", it->second.c_str(), tid);
             } else {
-                snprintf(_buf, sizeof(_buf), "[tid=%d]", tid);
+                snprintf(_buf, sizeof(_buf) - 1, "[tid=%d]", tid);
             }
             return _buf;
         }
 
         case BCI_ERROR: {
-            snprintf(_buf, sizeof(_buf), "[%s]", (const char*)frame.method_id);
+            snprintf(_buf, sizeof(_buf) - 1, "[%s]", (const char*)frame.method_id);
             return _buf;
         }
 
@@ -178,3 +252,22 @@ const char* FrameName::name(ASGCT_CallFrame& frame) {
         }
     }
 }
+
+bool FrameName::include(const char* frame_name) {
+    for (int i = 0; i < _include.size(); i++) {
+        if (_include[i].matches(frame_name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool FrameName::exclude(const char* frame_name) {
+    for (int i = 0; i < _exclude.size(); i++) {
+        if (_exclude[i].matches(frame_name)) {
+            return true;
+        }
+    }
+    return false;
+}
+

@@ -1,5 +1,6 @@
-PROFILER_VERSION=1.5
+PROFILER_VERSION=1.7-ea3
 JATTACH_VERSION=1.5
+JAVAC_RELEASE_VERSION=6
 LIB_PROFILER=libasyncProfiler.so
 JATTACH=jattach
 PROFILER_JAR=async-profiler.jar
@@ -35,7 +36,9 @@ all: build build/$(LIB_PROFILER) build/$(JATTACH) build/$(PROFILER_JAR)
 release: build async-profiler-$(RELEASE_TAG).tar.gz
 
 async-profiler-$(RELEASE_TAG).tar.gz: build/$(LIB_PROFILER) build/$(JATTACH) \
-                                      build/$(PROFILER_JAR) profiler.sh LICENSE *.md
+                                      build/$(PROFILER_JAR) profiler.sh LICENSE NOTICE *.md
+	chmod 755 build profiler.sh
+	chmod 644 LICENSE NOTICE *.md
 	tar cvzf $@ $^
 
 build:
@@ -49,7 +52,7 @@ build/$(JATTACH): src/jattach/jattach.c
 
 build/$(PROFILER_JAR): src/java/one/profiler/*.java
 	mkdir -p build/classes
-	$(JAVAC) -source 6 -target 6 -d build/classes $^
+	$(JAVAC) -source $(JAVAC_RELEASE_VERSION) -target $(JAVAC_RELEASE_VERSION) -d build/classes $^
 	$(JAR) cvf $@ -C build/classes .
 	rm -rf build/classes
 
@@ -57,6 +60,7 @@ test: all
 	test/smoke-test.sh
 	test/thread-smoke-test.sh
 	test/alloc-smoke-test.sh
+	test/load-library-test.sh
 	echo "All tests passed"
 
 clean:

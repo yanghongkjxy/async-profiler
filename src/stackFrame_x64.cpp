@@ -16,6 +16,8 @@
 
 #ifdef __x86_64__
 
+#include <errno.h>
+#include <sys/syscall.h>
 #include "stackFrame.h"
 
 
@@ -36,6 +38,10 @@ uintptr_t& StackFrame::sp() {
 
 uintptr_t& StackFrame::fp() {
     return (uintptr_t&)REG(REG_RBP, __rbp);
+}
+
+uintptr_t StackFrame::retval() {
+    return (uintptr_t)REG(REG_RAX, __rax);
 }
 
 uintptr_t StackFrame::arg0() {
@@ -59,12 +65,6 @@ void StackFrame::ret() {
     sp() += 8;
 }
 
-
-static inline bool withinCurrentStack(uintptr_t value) {
-    // Check that value is not too far from stack pointer of current context
-    void* real_sp;
-    return value - (uintptr_t)&real_sp <= 0xffff;
-}
 
 static inline bool isFramePrologueEpilogue(uintptr_t pc) {
     if (pc & 0xfff) {
@@ -91,23 +91,64 @@ static inline bool isFramePrologueEpilogue(uintptr_t pc) {
 }
 
 bool StackFrame::pop(bool trust_frame_pointer) {
-    if (!withinCurrentStack(sp())) {
-        return false;
-    }
-
     if (trust_frame_pointer && withinCurrentStack(fp())) {
         sp() = fp() + 16;
         fp() = stackAt(-2);
         pc() = stackAt(-1);
+        return true;
     } else if (fp() == sp() || withinCurrentStack(stackAt(0)) || isFramePrologueEpilogue(pc())) {
         fp() = stackAt(0);
         pc() = stackAt(1);
         sp() += 16;
-    } else {
-        pc() = stackAt(0);
-        sp() += 8;
+        return true;
     }
-    return true;
+    return false;
+}
+
+bool StackFrame::checkInterruptedSyscall() {
+#ifdef __APPLE__
+    // We are not interested in syscalls that do not check error code, e.g. semaphore_wait_trap
+    if (*(instruction_t*)pc() == 0xc3) {
+        return true;
+    }
+    // If CF is set, the error code is in low byte of eax,
+    // some other syscalls (ulock_wait) do not set CF when interrupted
+    if (REG(REG_EFL, __rflags) & 1) {
+        return (retval() & 0xff) == EINTR || (retval() & 0xff) == ETIMEDOUT;
+    } else {
+        return retval() == (uintptr_t)-EINTR; 
+    }
+#else
+    if (retval() == (uintptr_t)-EINTR) {
+        // Workaround for JDK-8237858: restart the interrupted poll() manually.
+        // Check if the previous instruction is mov eax, SYS_poll
+        uintptr_t pc = this->pc();
+        if ((pc & 0xfff) >= 7 && *(unsigned char*)(pc - 7) == 0xb8 && *(int*)(pc - 6) == SYS_poll) {
+            this->pc() = pc - 7;
+        }
+        return true;
+    }
+    return false;
+#endif
+}
+
+int StackFrame::callerLookupSlots() {
+    return 7;
+}
+
+bool StackFrame::isReturnAddress(instruction_t* pc) {
+    if (pc[-5] == 0xe8) {
+        // call rel32
+        return true;
+    } else if (pc[-2] == 0xff && ((pc[-1] & 0xf0) == 0xd0 || (pc[-1] & 0xf0) == 0x10)) {
+        // call reg or call [reg]
+        return true;
+    }
+    return false;
+}
+
+bool StackFrame::isSyscall(instruction_t* pc) {
+    return pc[0] == 0x0f && pc[1] == 0x05;
 }
 
 #endif // __x86_64__

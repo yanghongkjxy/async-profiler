@@ -27,6 +27,7 @@ enum ASGCT_CallFrameType {
     BCI_SYMBOL_OUTSIDE_TLAB = -12,  // VMSymbol* specifically for allocations outside TLAB
     BCI_THREAD_ID           = -13,  // method_id designates a thread
     BCI_ERROR               = -14,  // method_id is error string
+    BCI_INSTRUMENT          = -15,  // synthetic method_id that should not appear in the call stack
 };
 
 // See hotspot/src/share/vm/prims/forte.cpp
@@ -64,11 +65,15 @@ class VM {
   private:
     static JavaVM* _vm;
     static jvmtiEnv* _jvmti;
+    static bool _hotspot;
 
+    static void* getLibraryHandle(const char* name);
     static void loadMethodIDs(jvmtiEnv* jvmti, jclass klass);
     static void loadAllMethodIDs(jvmtiEnv* jvmti);
 
   public:
+    static void* _libjvm;
+    static void* _libjava;
     static AsyncGetCallTrace _asyncGetCallTrace;
 
     static void init(JavaVM* vm, bool attach);
@@ -80,6 +85,10 @@ class VM {
     static JNIEnv* jni() {
         JNIEnv* jni;
         return _vm->GetEnv((void**)&jni, JNI_VERSION_1_6) == 0 ? jni : NULL;
+    }
+
+    static bool is_hotspot() {
+        return _hotspot;
     }
 
     static void JNICALL VMInit(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread);

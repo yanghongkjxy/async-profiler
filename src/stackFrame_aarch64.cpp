@@ -19,6 +19,7 @@
 
 #if defined(__aarch64__)
 
+#include <errno.h>
 #include "stackFrame.h"
 
 
@@ -35,6 +36,10 @@ uintptr_t& StackFrame::sp() {
 
 uintptr_t& StackFrame::fp() {
     return (uintptr_t&)_ucontext->uc_mcontext.regs[REG_FP];
+}
+
+uintptr_t StackFrame::retval() {
+    return (uintptr_t)_ucontext->uc_mcontext.regs[0];
 }
 
 uintptr_t StackFrame::arg0() {
@@ -70,6 +75,23 @@ bool StackFrame::pop(bool trust_frame_pointer) {
         pc() = _ucontext->uc_mcontext.regs[REG_LR];
     }
     return true;
+}
+
+bool StackFrame::checkInterruptedSyscall() {
+    return retval() == (uintptr_t)-EINTR;
+}
+
+int StackFrame::callerLookupSlots() {
+    return 0;
+}
+
+bool StackFrame::isReturnAddress(instruction_t* pc) {
+    return false;
+}
+
+bool StackFrame::isSyscall(instruction_t* pc) {
+    // svc #0
+    return *pc == 0xd4000001;
 }
 
 #endif // defined(__aarch64__)

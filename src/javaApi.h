@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 Andrei Pangin
+ * Copyright 2020 Andrei Pangin
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,15 +14,16 @@
  * limitations under the License.
  */
 
-package one.profiler;
+#ifndef _JAVAAPI_H
+#define _JAVAAPI_H
 
-/**
- * Predefined event names to use in {@link AsyncProfiler#start(String, long)}
- */
-public class Events {
-    public static final String CPU    = "cpu";
-    public static final String ALLOC  = "alloc";
-    public static final String LOCK   = "lock";
-    public static final String WALL   = "wall";
-    public static final String ITIMER = "itimer";
-}
+#include <jvmti.h>
+
+
+class JavaAPI {
+  public:
+    static void throwNew(JNIEnv* env, const char* exception_class, const char* message);
+    static void registerNatives(jvmtiEnv* jvmti, JNIEnv* jni);
+};
+
+#endif // _JAVAAPI_H

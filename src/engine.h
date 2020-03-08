@@ -18,6 +18,7 @@
 #define _ENGINE_H
 
 #include "arguments.h"
+#include "codeCache.h"
 
 
 class Engine {
@@ -25,14 +26,16 @@ class Engine {
     virtual const char* name() = 0;
     virtual const char* units() = 0;
 
+    virtual Error check(Arguments& args);
     virtual Error start(Arguments& args) = 0;
     virtual void stop() = 0;
 
-    virtual void onThreadStart() {}
-    virtual void onThreadEnd() {}
+    virtual void onThreadStart(int tid) {}
+    virtual void onThreadEnd(int tid) {}
 
+    virtual bool requireNativeTrace();
     virtual int getNativeTrace(void* ucontext, int tid, const void** callchain, int max_depth,
-                               const void* jit_min_address, const void* jit_max_address);
+                               CodeCache* java_methods, CodeCache* runtime_stubs);
 };
 
 #endif // _ENGINE_H

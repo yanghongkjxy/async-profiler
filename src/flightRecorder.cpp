@@ -25,8 +25,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include "flightRecorder.h"
-#include "os.h"
 #include "profiler.h"
+#include "threadFilter.h"
 #include "vmStructs.h"
 
 
@@ -64,18 +64,20 @@ enum EventTypeId {
 };
 
 enum ContentTypeId {
-    CONTENT_NONE        = 0,
-    CONTENT_MEMORY      = 1,
-    CONTENT_EPOCHMILLIS = 2,
-    CONTENT_MILLIS      = 3,
-    CONTENT_NANOS       = 4,
-    CONTENT_THREAD      = 7,
-    CONTENT_STACKTRACE  = 9,
-    CONTENT_CLASS       = 10,
-    CONTENT_METHOD      = 32,
-    CONTENT_SYMBOL      = 33,
-    CONTENT_STATE       = 34,
-    CONTENT_FRAME_TYPE  = 47,
+    CONTENT_NONE         = 0,
+    CONTENT_MEMORY       = 1,
+    CONTENT_EPOCHMILLIS  = 2,
+    CONTENT_MILLIS       = 3,
+    CONTENT_NANOS        = 4,
+    CONTENT_THREAD       = 7,
+    CONTENT_JAVA_THREAD  = 8,
+    CONTENT_STACKTRACE   = 9,
+    CONTENT_CLASS        = 10,
+    CONTENT_THREAD_GROUP = 31,
+    CONTENT_METHOD       = 32,
+    CONTENT_SYMBOL       = 33,
+    CONTENT_STATE        = 34,
+    CONTENT_FRAME_TYPE   = 47,
 };
 
 enum FrameTypeId {
@@ -89,8 +91,9 @@ enum FrameTypeId {
 };
 
 enum ThreadStateId {
-    STATE_RUNNABLE    = 1,
-    STATE_TOTAL_COUNT = 1
+    STATE_RUNNABLE    = THREAD_RUNNING,
+    STATE_SLEEPING    = THREAD_SLEEPING,
+    STATE_TOTAL_COUNT = 2
 };
 
 
@@ -155,6 +158,14 @@ const DataStructure
     ds_thread[] = {
         {"name", "Thread name", T_UTF8},
     },
+    ds_java_thread[] = {
+        {"thread", "OS Thread ID", T_U4, CONTENT_THREAD},
+        {"group", "Java Thread Group", T_U4, CONTENT_THREAD_GROUP},
+    },
+    ds_thread_group[] = {
+        {"parent", "Parent", T_U4, CONTENT_THREAD_GROUP},
+        {"name", "Name", T_UTF8},
+    },
     ds_frame_type[] = {
         {"desc", "Description", T_UTF8},
     },
@@ -180,7 +191,7 @@ const DataStructure
     },
     ds_stacktrace[] = {
         {"truncated", "Truncated", T_BOOLEAN},
-        {"frames", "Stack frames", T_STRUCTARRAY, CONTENT_NONE, /* ds_frame */ 6},
+        {"frames", "Stack frames", T_STRUCTARRAY, CONTENT_NONE, /* ds_frame */ 8},
     },
     ds_method_sample[] = {
         {"sampledThread", "Thread", T_U4, CONTENT_THREAD},
@@ -189,17 +200,19 @@ const DataStructure
     };
 
 const EventType et_profile[] = {
-    {EVENT_EXECUTION_SAMPLE, "Method Profiling Sample", "Snapshot of a threads state", "vm/prof/execution_sample", false, false, false, true, /* ds_method_sample */ 8},
+    {EVENT_EXECUTION_SAMPLE, "Method Profiling Sample", "Snapshot of a threads state", "vm/prof/execution_sample", false, false, false, true, /* ds_method_sample */ 10},
 };
 
 const ContentType ct_profile[] = {
     {CONTENT_SYMBOL, "UTFConstant", "UTF constant", T_U8, 0},
     {CONTENT_THREAD, "Thread", "Thread", T_U4, 1},
-    {CONTENT_FRAME_TYPE, "FrameType", "Frame type", T_U1, 2},
-    {CONTENT_STATE, "ThreadState", "Java Thread State", T_U2, 3},
-    {CONTENT_CLASS, "Class", "Java class", T_U8, 4},
-    {CONTENT_METHOD, "Method", "Java method", T_U8, 5},
-    {CONTENT_STACKTRACE, "StackTrace", "Stacktrace", T_U8, 7},
+    {CONTENT_JAVA_THREAD, "JavaThread", "Java thread", T_U8, 2},
+    {CONTENT_THREAD_GROUP, "ThreadGroup", "Thread group", T_U4, 3},
+    {CONTENT_FRAME_TYPE, "FrameType", "Frame type", T_U1, 4},
+    {CONTENT_STATE, "ThreadState", "Java Thread State", T_U2, 5},
+    {CONTENT_CLASS, "Class", "Java class", T_U8, 6},
+    {CONTENT_METHOD, "Method", "Java method", T_U8, 7},
+    {CONTENT_STACKTRACE, "StackTrace", "Stacktrace", T_U8, 9},
 };
 
 
@@ -292,7 +305,7 @@ class Recording {
   private:
     Buffer _buf[CONCURRENCY_LEVEL];
     int _fd;
-    u64 _bytes_written;
+    ThreadFilter _thread_set;
     std::map<std::string, int> _symbol_map;
     std::map<std::string, int> _class_map;
     std::map<jmethodID, MethodInfo> _method_map;
@@ -302,7 +315,7 @@ class Recording {
     u64 _stop_nanos;
 
   public:
-    Recording(int fd) : _fd(fd), _bytes_written(0), _symbol_map(), _class_map(), _method_map() {
+    Recording(int fd) : _fd(fd), _thread_set(), _symbol_map(), _class_map(), _method_map() {
         _start_time = OS::millis();
         _start_nanos = OS::nanotime();
 
@@ -321,22 +334,22 @@ class Recording {
         writeRecordingInfo(_buf);
         flush(_buf);
 
-        u64 checkpoint_offset = _bytes_written;
+        off_t checkpoint_offset = lseek(_fd, 0, SEEK_CUR);
         writeCheckpoint(_buf);
         flush(_buf);
 
-        u64 metadata_offset = _bytes_written;
+        off_t metadata_offset = lseek(_fd, 0, SEEK_CUR);
         writeMetadata(_buf, checkpoint_offset);
         flush(_buf);
 
         // Patch checkpoint size field
         int checkpoint_size = htonl((int)(metadata_offset - checkpoint_offset));
-        ssize_t result = pwrite(_fd, &checkpoint_size, sizeof(checkpoint_size), (off_t)checkpoint_offset);
+        ssize_t result = pwrite(_fd, &checkpoint_size, sizeof(checkpoint_size), checkpoint_offset);
         (void)result;
 
         // Patch metadata offset
-        metadata_offset = OS::hton64(metadata_offset);
-        result = pwrite(_fd, &metadata_offset, sizeof(metadata_offset), 8);
+        u64 metadata_start = OS::hton64(metadata_offset);
+        result = pwrite(_fd, &metadata_start, sizeof(metadata_start), 8);
         (void)result;
 
         close(_fd);
@@ -435,7 +448,7 @@ class Recording {
 
     void flush(Buffer* buf) {
         ssize_t result = write(_fd, buf->data(), buf->offset());
-        if (result > 0) atomicInc(_bytes_written, result);
+        (void)result;
         buf->reset();
     }
 
@@ -495,6 +508,7 @@ class Recording {
         buf->put32(CONTENT_STATE);
         buf->put32(STATE_TOTAL_COUNT);
         buf->put16(STATE_RUNNABLE);    buf->putUtf8("STATE_RUNNABLE");
+        buf->put16(STATE_SLEEPING);    buf->putUtf8("STATE_SLEEPING");
     }
 
     void writeStackTraces(Buffer* buf) {
@@ -564,7 +578,50 @@ class Recording {
     }
 
     void writeThreads(Buffer* buf) {
+        int thread_count = _thread_set.size();
+        int* threads = new int[thread_count];
+        _thread_set.collect(threads, thread_count);
+
+        MutexLocker ml(Profiler::_instance._thread_names_lock);
+        std::map<int, std::string>& thread_names = Profiler::_instance._thread_names;
+        char name_buf[32];
+
         buf->put32(CONTENT_THREAD);
+        buf->put32(thread_count);
+        for (int i = 0; i < thread_count; i++) {
+            const char* thread_name;
+            std::map<int, std::string>::const_iterator it = thread_names.find(threads[i]);
+            if (it != thread_names.end()) {
+                thread_name = it->second.c_str();
+            } else {
+                sprintf(name_buf, "[tid=%d]", threads[i]);
+                thread_name = name_buf;
+            }
+
+            buf->put32(threads[i]);
+            buf->putUtf8(thread_name);
+            flushIfNeeded(buf);
+        }
+
+        delete[] threads;
+    }
+
+    void writeJavaThreads(Buffer* buf) {
+        MutexLocker ml(Profiler::_instance._thread_names_lock);
+        std::map<jlong, int>& thread_ids = Profiler::_instance._thread_ids;
+
+        buf->put32(CONTENT_JAVA_THREAD);
+        buf->put32(thread_ids.size());
+        for (std::map<jlong, int>::const_iterator it = thread_ids.begin(); it != thread_ids.end(); ++it) {
+            buf->put64(it->first);
+            buf->put32(it->second);
+            buf->put32(0);  // group
+            flushIfNeeded(buf);
+        }
+    }
+
+    void writeThreadGroups(Buffer* buf) {
+        buf->put32(CONTENT_THREAD_GROUP);
         buf->put32(0);
     }
 
@@ -580,6 +637,8 @@ class Recording {
         writeClasses(buf);
         writeSymbols(buf);
         writeThreads(buf);
+        writeJavaThreads(buf);
+        writeThreadGroups(buf);
     }
 
     void writeDataStructure(Buffer* buf, int count, const DataStructure* ds) {
@@ -652,9 +711,11 @@ class Recording {
         buf->put32(0);
 
         // Data structures
-        buf->put32(9);
+        buf->put32(11);
         writeDataStructure(buf, ARRAY_SIZE(ds_utf8), ds_utf8);
         writeDataStructure(buf, ARRAY_SIZE(ds_thread), ds_thread);
+        writeDataStructure(buf, ARRAY_SIZE(ds_java_thread), ds_java_thread);
+        writeDataStructure(buf, ARRAY_SIZE(ds_thread_group), ds_thread_group);
         writeDataStructure(buf, ARRAY_SIZE(ds_frame_type), ds_frame_type);
         writeDataStructure(buf, ARRAY_SIZE(ds_state), ds_state);
         writeDataStructure(buf, ARRAY_SIZE(ds_class), ds_class);
@@ -668,7 +729,7 @@ class Recording {
         writeContentTypes(buf, ARRAY_SIZE(ct_profile), ct_profile);
     }
 
-    void writeMetadata(Buffer* buf, u64 checkpoint_offset) {
+    void writeMetadata(Buffer* buf, off_t checkpoint_offset) {
         int metadata_start = buf->offset();
         buf->put32(0);
         buf->put32(EVENT_METADATA);
@@ -687,15 +748,19 @@ class Recording {
         buf->put32(metadata_start, buf->offset() - metadata_start);
     }
 
-    void recordExecutionSample(int lock_index, int tid, int call_trace_id) {
+    void recordExecutionSample(int lock_index, int tid, int call_trace_id, ThreadState thread_state) {
         Buffer* buf = &_buf[lock_index];
         buf->put32(30);
         buf->put32(EVENT_EXECUTION_SAMPLE);
         buf->put64(OS::nanotime());
         buf->put32(tid);
         buf->put64(call_trace_id);
-        buf->put16(STATE_RUNNABLE);
+        buf->put16(thread_state);
         flushIfNeeded(buf);
+    }
+
+    void addThread(int tid) {
+        _thread_set.add(tid);
     }
 };
 
@@ -721,8 +786,9 @@ void FlightRecorder::stop() {
     }
 }
 
-void FlightRecorder::recordExecutionSample(int lock_index, int tid, int call_trace_id) {
+void FlightRecorder::recordExecutionSample(int lock_index, int tid, int call_trace_id, ThreadState thread_state) {
     if (_rec != NULL && call_trace_id != 0) {
-        _rec->recordExecutionSample(lock_index, tid, call_trace_id);
+        _rec->recordExecutionSample(lock_index, tid, call_trace_id, thread_state);
+        _rec->addThread(tid);
     }
 }

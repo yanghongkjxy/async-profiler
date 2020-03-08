@@ -27,6 +27,7 @@
 #include <errno.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <linux/perf_event.h>
 #include "arch.h"
@@ -35,6 +36,7 @@
 #include "profiler.h"
 #include "spinLock.h"
 #include "stackFrame.h"
+#include "symbols.h"
 
 
 // Ancient fcntl.h does not define F_SETOWN_EX constants and structures
@@ -58,17 +60,6 @@ enum {
 
 
 static const unsigned long PERF_PAGE_SIZE = sysconf(_SC_PAGESIZE);
-
-static int getMaxPID() {
-    char buf[16] = "65536";
-    int fd = open("/proc/sys/kernel/pid_max", O_RDONLY);
-    if (fd != -1) {
-        ssize_t r = read(fd, buf, sizeof(buf) - 1);
-        (void) r;
-        close(fd);
-    }
-    return atoi(buf);
-}
 
 // Get perf_event_attr.config numeric value of the given tracepoint name
 // by reading /sys/kernel/debug/tracing/events/<name>/id file
@@ -121,6 +112,22 @@ struct PerfEventType {
         return 0;
     }
 
+    static void mangle(char* name, char* buf, size_t size) {
+        char* buf_end = buf + size;
+        strcpy(buf, "_ZN");
+        buf += 3;
+
+        for (char* c; (c = strstr(name, "::")) != NULL && buf < buf_end; name = c + 2) {
+            *c = 0;
+            buf += snprintf(buf, buf_end - buf, "%d%s", (int)strlen(name), name);
+        }
+
+        if (buf < buf_end) {
+            snprintf(buf, buf_end - buf, "%d%sE", (int)strlen(name), name);
+        }
+        buf_end[-1] = 0;
+    }
+
     static PerfEventType* findByType(__u32 type) {
         for (PerfEventType* event = AVAILABLE_EVENTS; ; event++) {
             if (event->type == type) {
@@ -137,7 +144,7 @@ struct PerfEventType {
 
         // Parse access type [:rwx]
         char* c = strrchr(buf, ':');
-        if (c != NULL) {
+        if (c != NULL && c != name && c[-1] != ':') {
             *c++ = 0;
             if (strcmp(c, "r") == 0) {
                 bp_type = HW_BREAKPOINT_R;
@@ -170,14 +177,25 @@ struct PerfEventType {
         __u64 addr;
         if (strncmp(buf, "0x", 2) == 0) {
             addr = (__u64)strtoll(buf, NULL, 0);
+        } else if (strstr(buf, "::") != NULL) {
+            char mangled_name[256];
+            mangle(buf, mangled_name, sizeof(mangled_name));
+            addr = (__u64)(uintptr_t)Profiler::_instance.findSymbolByPrefix(mangled_name);
         } else {
             addr = (__u64)(uintptr_t)dlsym(RTLD_DEFAULT, buf);
             if (addr == 0) {
-                addr = (__u64)(uintptr_t)Profiler::_instance.findSymbol(buf);
+                size_t len = strlen(buf);
+                if (len > 0 && buf[len - 1] == '*') {
+                    buf[len - 1] = 0;
+                    addr = (__u64)(uintptr_t)Profiler::_instance.findSymbolByPrefix(buf);
+                } else {
+                    addr = (__u64)(uintptr_t)Profiler::_instance.findSymbol(buf);
+                }
             }
-            if (addr == 0) {
-                return NULL;
-            }
+        }
+
+        if (addr == 0) {
+            return NULL;
         }
 
         PerfEventType* breakpoint = findByType(PERF_TYPE_BREAKPOINT);
@@ -214,7 +232,8 @@ struct PerfEventType {
         }
 
         // Kernel tracepoints defined in debugfs
-        if (strchr(name, ':') != NULL) {
+        const char* c = strchr(name, ':');
+        if (c != NULL && c[1] != ':') {
             int tracepoint_id = findTracepointId(name);
             if (tracepoint_id > 0) {
                 return getTracepoint(tracepoint_id);
@@ -336,7 +355,6 @@ bool PerfEvents::createForThread(int tid) {
     attr.sample_type = PERF_SAMPLE_CALLCHAIN;
     attr.disabled = 1;
     attr.wakeup_events = 1;
-    attr.exclude_idle = 1;
 
     if (_ring == RING_USER) {
         attr.exclude_kernel = 1;
@@ -349,8 +367,8 @@ bool PerfEvents::createForThread(int tid) {
         int err = errno;
         perror("perf_event_open failed");
         if (err == EACCES && _print_extended_warning) {
-            fprintf(stderr, "Due to permission restrictions, you cannot collect kernel events.\n");
-            fprintf(stderr, "Try with --all-user option, or 'echo 1 > /proc/sys/kernel/perf_event_paranoid'\n");
+            fprintf(stderr, "Due to permission restrictions, you cannot collect kernel events.\n"
+                            "Try with --all-user option, or 'echo 1 > /proc/sys/kernel/perf_event_paranoid'\n");
             _print_extended_warning = false;
         }
         return false;
@@ -438,6 +456,43 @@ const char* PerfEvents::units() {
     return dash != NULL ? dash + 1 : _event_type->name;
 }
 
+Error PerfEvents::check(Arguments& args) {
+    PerfEventType* event_type = PerfEventType::forName(args._event);
+    if (event_type == NULL) {
+        return Error("Unsupported event type");
+    }
+
+    struct perf_event_attr attr = {0};
+    attr.size = sizeof(attr);
+    attr.type = event_type->type;
+
+    if (attr.type == PERF_TYPE_BREAKPOINT) {
+        attr.bp_addr = event_type->config;
+        attr.bp_type = event_type->bp_type;
+        attr.bp_len = event_type->bp_len;
+    } else {
+        attr.config = event_type->config;
+    }
+
+    attr.sample_period = event_type->default_interval;
+    attr.sample_type = PERF_SAMPLE_CALLCHAIN;
+    attr.disabled = 1;
+
+    if (args._ring == RING_USER || !Symbols::haveKernelSymbols()) {
+        attr.exclude_kernel = 1;
+    } else if (args._ring == RING_KERNEL) {
+        attr.exclude_user = 1;
+    }
+
+    int fd = syscall(__NR_perf_event_open, &attr, 0, -1, -1, 0);
+    if (fd == -1) {
+        return Error(strerror(errno));
+    }
+
+    close(fd);
+    return Error::OK;
+}
+
 Error PerfEvents::start(Arguments& args) {
     _event_type = PerfEventType::forName(args._event);
     if (_event_type == NULL) {
@@ -450,15 +505,21 @@ Error PerfEvents::start(Arguments& args) {
     _interval = args._interval ? args._interval : _event_type->default_interval;
 
     _ring = args._ring;
+    if (_ring != RING_USER && !Symbols::haveKernelSymbols()) {
+        fprintf(stderr, "WARNING: Kernel symbols are unavailable due to restrictions. Try\n"
+                        "  echo 0 > /proc/sys/kernel/kptr_restrict\n"
+                        "  echo 1 > /proc/sys/kernel/perf_event_paranoid\n");
+        _ring = RING_USER;
+    }
     _print_extended_warning = _ring != RING_USER;
 
-    int max_events = getMaxPID();
+    int max_events = OS::getMaxThreadId();
     if (max_events != _max_events) {
         free(_events);
         _events = (PerfEvent*)calloc(max_events, sizeof(PerfEvent));
         _max_events = max_events;
     }
-    
+
     OS::installSignalHandler(SIGPROF, signalHandler);
 
     // Enable thread events before traversing currently running threads
@@ -485,16 +546,8 @@ void PerfEvents::stop() {
     }
 }
 
-void PerfEvents::onThreadStart() {
-    createForThread(OS::threadId());
-}
-
-void PerfEvents::onThreadEnd() {
-    destroyForThread(OS::threadId());
-}
-
 int PerfEvents::getNativeTrace(void* ucontext, int tid, const void** callchain, int max_depth,
-                               const void* jit_min_address, const void* jit_max_address) {
+                               CodeCache* java_methods, CodeCache* runtime_stubs) {
     PerfEvent* event = &_events[tid];
     if (!event->tryLock()) {
         return 0;  // the event is being destroyed
@@ -518,11 +571,11 @@ int PerfEvents::getNativeTrace(void* ucontext, int tid, const void** callchain, 
                     u64 ip = ring.next();
                     if (ip < PERF_CONTEXT_MAX) {
                         const void* iptr = (const void*)ip;
-                        if (iptr >= jit_min_address && iptr < jit_max_address) {
+                        callchain[depth++] = iptr;
+                        if (java_methods->contains(iptr) || runtime_stubs->contains(iptr)) {
                             // Stop at the first Java frame
                             break;
                         }
-                        callchain[depth++] = iptr;
                     }
                 }
                 break;
@@ -538,7 +591,10 @@ int PerfEvents::getNativeTrace(void* ucontext, int tid, const void** callchain, 
 }
 
 bool PerfEvents::supported() {
-    return true;
+    // The official way of knowing if perf_event_open() support is enabled
+    // is checking for the existence of the file /proc/sys/kernel/perf_event_paranoid
+    struct stat statbuf;
+    return stat("/proc/sys/kernel/perf_event_paranoid", &statbuf) == 0;
 }
 
 const char* PerfEvents::getEventName(int event_id) {

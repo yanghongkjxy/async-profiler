@@ -22,6 +22,7 @@
 
 const long DEFAULT_INTERVAL = 10000000;  // 10 ms
 const int DEFAULT_FRAMEBUF = 1000000;
+const int DEFAULT_JSTACKDEPTH = 2048;
 
 const char* const EVENT_CPU    = "cpu";
 const char* const EVENT_ALLOC  = "alloc";
@@ -32,10 +33,13 @@ const char* const EVENT_ITIMER = "itimer";
 enum Action {
     ACTION_NONE,
     ACTION_START,
+    ACTION_RESUME,
     ACTION_STOP,
+    ACTION_CHECK,
     ACTION_STATUS,
     ACTION_LIST,
     ACTION_VERSION,
+    ACTION_FULL_VERSION,
     ACTION_DUMP
 };
 
@@ -48,6 +52,22 @@ enum Ring {
     RING_ANY,
     RING_KERNEL,
     RING_USER
+};
+
+enum Style {
+    STYLE_SIMPLE     = 1,
+    STYLE_DOTTED     = 2,
+    STYLE_SIGNATURES = 4,
+    STYLE_ANNOTATE   = 8
+};
+
+enum Output {
+    OUTPUT_NONE,
+    OUTPUT_TEXT,
+    OUTPUT_COLLAPSED,
+    OUTPUT_FLAMEGRAPH,
+    OUTPUT_TREE,
+    OUTPUT_JFR
 };
 
 
@@ -73,9 +93,14 @@ class Error {
 
 class Arguments {
   private:
-    char _buf[1024];
+    char* _buf;
 
-    long parseUnits(const char* str);
+    void appendToEmbeddedList(int& list, char* value);
+
+    static long long hash(const char* arg);
+    static const char* expandFilePattern(char* dest, size_t max_size, const char* pattern);
+    static Output detectOutputFormat(const char* file);
+    static long parseUnits(const char* str);
 
   public:
     Action _action;
@@ -85,15 +110,14 @@ class Arguments {
     long _interval;
     int  _jstackdepth;
     int _framebuf;
+    const char* _file;
+    const char* _filter;
+    int _include;
+    int _exclude;
     bool _threads;
-    bool _simple;
-    bool _annotate;
-    char* _file;
-    bool _dump_collapsed;
-    bool _dump_flamegraph;
-    bool _dump_tree;
-    bool _dump_jfr;
-    bool _dump_summary;
+    char _cstack;
+    int _style;
+    Output _output;
     int _dump_traces;
     int _dump_flat;
     // FlameGraph parameters
@@ -104,36 +128,38 @@ class Arguments {
     bool _reverse;
 
     Arguments() :
+        _buf(NULL),
         _action(ACTION_NONE),
         _counter(COUNTER_SAMPLES),
         _ring(RING_ANY),
         _event(EVENT_CPU),
         _interval(0),
-        _jstackdepth(0),
+        _jstackdepth(DEFAULT_JSTACKDEPTH),
         _framebuf(DEFAULT_FRAMEBUF),
-        _threads(false),
-        _simple(false),
-        _annotate(false),
         _file(NULL),
-        _dump_collapsed(false),
-        _dump_flamegraph(false),
-        _dump_tree(false),
-        _dump_jfr(false),
-        _dump_summary(false),
+        _filter(NULL),
+        _include(0),
+        _exclude(0),
+        _threads(false),
+        _cstack(0),
+        _style(0),
+        _output(OUTPUT_NONE),
         _dump_traces(0),
         _dump_flat(0),
         _title("Flame Graph"),
         _width(1200),
         _height(16),
-        _minwidth(1),
+        _minwidth(0.25),
         _reverse(false) {
     }
 
-    bool dumpRequested() {
-        return _dump_collapsed || _dump_flamegraph || _dump_tree || _dump_jfr || _dump_summary || _dump_traces > 0 || _dump_flat > 0;
-    }
+    ~Arguments();
+
+    void save(Arguments& other);
 
     Error parse(const char* args);
+
+    friend class FrameName;
 };
 
 #endif // _ARGUMENTS_H

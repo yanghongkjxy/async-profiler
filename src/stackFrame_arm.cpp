@@ -16,6 +16,7 @@
 
 #if defined(__arm__) || defined(__thumb__)
 
+#include <errno.h>
 #include "stackFrame.h"
 
 
@@ -29,6 +30,10 @@ uintptr_t& StackFrame::sp() {
 
 uintptr_t& StackFrame::fp() {
     return (uintptr_t&)_ucontext->uc_mcontext.arm_fp;
+}
+
+uintptr_t StackFrame::retval() {
+    return (uintptr_t)_ucontext->uc_mcontext.arm_r0;
 }
 
 uintptr_t StackFrame::arg0() {
@@ -53,6 +58,23 @@ void StackFrame::ret() {
 
 bool StackFrame::pop(bool trust_frame_pointer) {
     return false;
+}
+
+bool StackFrame::checkInterruptedSyscall() {
+    return retval() == (uintptr_t)-EINTR;
+}
+
+int StackFrame::callerLookupSlots() {
+    return 0;
+}
+
+bool StackFrame::isReturnAddress(instruction_t* pc) {
+    return false;
+}
+
+bool StackFrame::isSyscall(instruction_t* pc) {
+    // swi #0
+    return *pc == 0xef000000;
 }
 
 #endif // defined(__arm__) || defined(__thumb__)

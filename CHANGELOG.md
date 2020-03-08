@@ -1,5 +1,42 @@
 # Changelog
 
+## [1.7-ea3] - In development
+
+### Features
+ - Profile invocations of arbitrary Java methods
+ - Java API to filter monitored threads
+ - `--cstack`/`--no-cstack` option
+
+### Improvements
+ - Thread names and Java thread IDs in JFR output
+ - Wall clock profiler distinguishes RUNNABLE vs. SLEEPING threads
+ - Stable profiling interval in wall clock mode
+ - C++ function names as events, e.g. `-e VMThread::execute`
+ - `check` command to test event availability
+ - Allow shading of AsyncProfiler API
+ - Enable CPU profiling on WSL
+ - Enable allocation profiling on Zing
+ - Reduce the amount of `unknown_Java` samples
+
+## [1.6] - 2019-09-09
+
+### Features
+ - Pause/resume profiling
+ - Allocation profiling support for JDK 12, 13 (contributed by @rraptorr)
+
+### Improvements
+ - Include all AsyncGetCallTrace failures in the profile
+ - Parse symbols of JNI libraries loaded in runtime
+ - The agent autodetects output format by the file extension
+ - Output file name patterns: `%p` and `%t`
+ - `-g` option to print method signatures
+ - `-j` can increase the maximum Java stack depth
+ - Allocaton sampling rate can be adjusted with `-i`
+ - Improved reliability on macOS
+
+### Changes
+ - `-f` file names are now relative to the current shell directory
+
 ## [1.5] - 2019-01-08
 
 ### Features
